@@ -2087,3 +2087,12 @@ async def send_message_handler(event):
     
 # Run bot
 bot.run_until_disconnected()
+
+
+# Start the keep-alive web server
+keep_alive()
+
+# Start the bot
+client.start(bot_token=BOT_TOKEN)
+client.run_until_disconnected()
+
