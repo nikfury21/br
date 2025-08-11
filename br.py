@@ -6,6 +6,27 @@ import random
 import os
 
 
+import os
+import threading
+from flask import Flask
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!", 200
+
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
+def keep_alive():
+    t = threading.Thread(target=run)
+    t.start()
+
+# Call before starting the bot
+keep_alive()
+
+
 API_ID = '5581609'
 API_HASH = '21e8ed894fc3eb3e40ca1d277609e114'
 BOT_TOKEN = '8189732338:AAHqlAzEE-W-rhbhGZlI6vgij-w4rWN-tkQ'
