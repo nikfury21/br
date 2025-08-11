@@ -29,7 +29,7 @@ keep_alive()
 
 API_ID = '5581609'
 API_HASH = '21e8ed894fc3eb3e40ca1d277609e114'
-BOT_TOKEN = '8189732338:AAHqlAzEE-W-rhbhGZlI6vgij-w4rWN-tkQ'
+BOT_TOKEN = '8074351087:AAE656jg51zZ9tA4pwREjb0Gd9qG6Jyw7oI'
 MOD_IDS = {7556899383, 7038303029}  # Replace with actual mod Telegram user IDs
 
 bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
