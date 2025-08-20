@@ -2563,27 +2563,27 @@ async def send_message_handler(event):
     # Fallback
     await event.reply("Usage:\n- In group (reply): .send <message>\n- In PM:\n  • .send <chat_id> <message>\n  • reply to media/text with .send <chat_id>")
 
+
 app = FastAPI()
 
 @app.get("/")
 async def health_check():
     return {"status": "ok"}
 
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot.run_until_disconnected())
+async def main():
+    # Run the bot and the webserver concurrently using async tasks
+    bot_task = asyncio.create_task(bot.run_until_disconnected())
+    web_task = asyncio.create_task(uvicorn_serve())
+    await asyncio.gather(bot_task, web_task)
 
-def run_webserver():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def uvicorn_serve():
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
 
 if __name__ == "__main__":
-    # Start bot in a separate thread
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.start()
-    
-    # Start web server in the main thread
-    run_webserver()
+    asyncio.run(main())
+
 
    
     
