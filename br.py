@@ -4,33 +4,17 @@ import asyncio
 import datetime
 import random
 import os
-
-
-import os
+from fastapi import FastAPI
+import uvicorn
 import threading
-from flask import Flask
+import asyncio
 
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running!", 200
-
-def run():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
-
-def keep_alive():
-    t = threading.Thread(target=run)
-    t.start()
-
-# Call before starting the bot
-keep_alive()
 
 
 API_ID = '5581609'
 API_HASH = '21e8ed894fc3eb3e40ca1d277609e114'
 BOT_TOKEN = '8074351087:AAE656jg51zZ9tA4pwREjb0Gd9qG6Jyw7oI'
-MOD_IDS = {7556899383, 7038303029}  # Replace with actual mod Telegram user IDs
+MOD_IDS = {7556899383, 7038303029, 1716686899, 7663874497, 7735193452}  # Replace with actual mod Telegram user IDs
 
 bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
@@ -38,7 +22,27 @@ sessions = {}
 locked_players = set()
 bot_start_time = datetime.datetime.now()
 
+async def show_reload_message(event, session):
+    # Decide how many bullets in this reload
+    total_bullets = random.randint(3, 8)
+    blank = random.randint(1, total_bullets - 1)
+    alive = total_bullets - blank
 
+    # Prepare bullet order
+    bullets = ['live'] * alive + ['blank'] * blank
+    random.shuffle(bullets)
+    session['bullet_queue'] = bullets
+
+    # Send reload message
+    await event.edit(
+        f"Live bullets - {alive}\n"
+        f"Blank bullets - {blank}\n\n"
+        "<pre> Shotgun is getting loaded...</pre>",
+        parse_mode='html'
+    )
+
+    # Small pause to mimic reload time
+    await asyncio.sleep(10)
 
 async def log_points(event, player_id, action_text):
     """
@@ -292,8 +296,8 @@ async def partner_selection(event):
     # Show teams + start button
     await event.edit(
         f"✅ Teams locked for 2v2:\n\n"
-        f"🔵 Team A: {team1_names}\n"
-        f"🔴 Team B: {team2_names}",
+        f"🔷 Team A: {team1_names}\n"
+        f"♦️ Team B: {team2_names}",
         buttons=[Button.inline("🕹 Start Game", b"start_game")],
         parse_mode="html"
     )
@@ -306,7 +310,7 @@ async def start_game(event):
     if not session or event.sender_id != session['creator']:
         await event.answer("User unaccessible", alert=True)
         return
-    await event.edit("Game is getting started...")
+    await event.edit("Game is starting... Hold a second while I am shuffling items.")
     await asyncio.sleep(4)
 
     total_bullets = random.randint(3, 8)
@@ -320,21 +324,31 @@ async def start_game(event):
 
 
     await event.edit(
-        f"Ready for the showdown?\n\nLive bullets - {alive}\nBlank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>",
+        f"Ready for the showdown?\n\n⚡ Live rounds - {alive}\n🎟️ Blank shells - {blank}\n\n<pre> Starting the game...!</pre>",
         parse_mode='html' # Explicitly setting parse_mode to html
     )
     await asyncio.sleep(10)
 
     # Setup round
+    
     session['round'] = 1
     if session.get("mode") == "2v2":
-         session["last_team_win"] = None
+        session["last_team_win"] = None
+        # 🔄 Arrange players in alternating-team order for the game start
+        if 'teams' in session:
+            team1, team2 = session['teams']
+            new_order = []
+            for i in range(len(team1)):
+                new_order.append(team1[i])
+                new_order.append(team2[i])
+            session['players'] = new_order
 
     session['turn_index'] = 0
     session.update({
-    'round': 1,
-    'wins': {uid: 0 for uid in session['players']},
-})
+        'round': 1,
+        'wins': {uid: 0 for uid in session['players']},
+    })
+
     shared_hp = random.randint(1, 2)
     session['hps'] = {uid: shared_hp for uid in session['players']}
     session['max_hps'] = {uid: shared_hp for uid in session['players']}  # ✅ tracks true max HP
@@ -386,10 +400,18 @@ async def start_game(event):
 # ---------- POINT SYSTEM BEGIN ----------
 def init_points_for_game(session):
     session['points'] = {uid: 0 for uid in session['players']}
+    session['round_points'] = {
+        uid: [0 for _ in range(session.get('max_rounds', 3))]
+        for uid in session['players']
+    }
     session['death_order'] = []
-
     session['rounds_won'] = {uid: 0 for uid in session['players']}
-    session['max_rounds'] = 3
+
+    if session.get("mode") == "2v2":
+        session['max_rounds'] = 3  # Always exactly 3 rounds
+    else:
+        session['max_rounds'] = 3  # Other modes can be changed if needed
+
 
 async def award_1v1_points(event, session, winner_id, loser_id):
     session['points'][winner_id] += 5000
@@ -404,14 +426,92 @@ async def award_1v3_points(event, session, elimination_order):
     for idx, uid in enumerate(elimination_order):
         pts = reward_mapping[idx]
         session['points'][uid] += pts
+        round_idx = session['round'] - 1
+        if 0 <= round_idx < len(session['round_points'][uid]):
+            session['round_points'][uid][round_idx] += pts
+
+       
+
         if idx < 3:
             await log_points(event, uid, f"died #{idx+1}, earned {pts} pts")
         else:
             await log_points(event, uid, f"won the round, gained {pts} pts")
 
 
+
+
+async def award_2v2_points(event, session, elimination_order):
+    """
+    2v2 Scoring Rules:
+    - Normal case:
+        1st dead  -> 1k
+        2nd dead  -> 2k
+        3rd dead  -> 3k
+        Last alive -> 5k
+    - Flawless case (both survivors from same team):
+        Eliminated players -> 1k and 2k
+        Winners -> one gets 5k, other gets 3k
+    """
+    team1, team2 = session['teams']
+    survivors = [uid for uid in session['players'] if uid not in elimination_order]
+
+    # Flawless case
+    if len(survivors) == 2 and (set(survivors) == set(team1) or set(survivors) == set(team2)):
+        # Award eliminated players
+        if len(elimination_order) >= 1:
+            session['points'][elimination_order[0]] += 1000
+            await log_points(event, elimination_order[0], "died 1st, earned 1000 pts")
+        if len(elimination_order) >= 2:
+            session['points'][elimination_order[1]] += 2000
+            await log_points(event, elimination_order[1], "died 2nd, earned 2000 pts")
+
+        # Flawless win: fixed 5k / 3k split for same-team survivors
+        if set(survivors) == set(team1):
+             session['points'][team1[0]] += 5000
+             session['points'][team1[1]] += 3000
+        elif set(survivors) == set(team2):
+             session['points'][team2[0]] += 5000
+             session['points'][team2[1]] += 3000
+
+        await log_points(event, survivors[0], "flawless survival — earned 5000 pts")
+        await log_points(event, survivors[1], "flawless survival — earned 3000 pts")
+
+
+    else:
+        # Normal round scoring
+        reward_mapping = [1000, 2000, 3000]  # last alive handled separately
+        for idx, uid in enumerate(elimination_order):
+            pts = reward_mapping[idx] if idx < len(reward_mapping) else 0
+            session['points'][uid] += pts
+            await log_points(event, uid, f"died #{idx+1}, earned {pts} pts")
+
+        if survivors:
+            last_alive = survivors[0]
+        else:
+    # Last alive is the final one in elimination_order
+            last_alive = elimination_order[-1]
+
+        session['points'][last_alive] += 5000
+        await log_points(event, last_alive, "won the round — earned 5000 pts")
+
+
+
+
+
+HEALING_PENALTY = 10  # ✅ central penalty value
+
 def apply_healing_penalty(session, uid):
-    session['points'][uid] -= 15
+    # make sure the player has a points entry
+    session['points'].setdefault(uid, 0)
+    session['points'][uid] -= HEALING_PENALTY
+
+    round_idx = session['round'] - 1
+    if 0 <= round_idx < len(session['round_points'][uid]):
+        session['round_points'][uid][round_idx] -= HEALING_PENALTY
+
+    
+
+
 
 async def award_shoot_points(event, session, shooter_id, target_id, is_live, damage, used_hacksaw=False, shot_type="dynamic shot"):
     pts_awarded = 0
@@ -421,27 +521,168 @@ async def award_shoot_points(event, session, shooter_id, target_id, is_live, dam
     if is_live:
         pts_awarded = 30 if used_hacksaw else 15
         session['points'][shooter_id] += pts_awarded
+        round_idx = session['round'] - 1
+        if 0 <= round_idx < len(session['round_points'][shooter_id]):
+            session['round_points'][shooter_id][round_idx] += pts_awarded
+
+
     await log_points(event, shooter_id,
                      f"shot {(await event.client.get_entity(target_id)).first_name} and dealt {damage}⚡️ using {shot_type}, gained {pts_awarded} pts")
 
 
-async def show_final_results(event, session):
-    if session['mode'] == "normal" and len(session['players']) == 2:
-        winner = max(session['points'], key=session['points'].get)
-        loser = min(session['points'], key=session['points'].get)
-        text = (
-            "🏆 Final Results (Best of 3)\n\n"
-            f"Winner: {await get_name(event, winner)} — {session['points'][winner]} pts\n"
-            f"Runner-Up: {await get_name(event, loser)} — {session['points'][loser]} pts"
-        )
-    elif session['mode'] == "1v3":
-        sorted_players = sorted(session['points'].items(), key=lambda x: x[1], reverse=True)
-        lines = [f"{rank+1}. {await get_name(event, uid)} — {pts} pts"
-                 for rank, (uid, pts) in enumerate(sorted_players)]
-        text = "🏆 Final Rankings (After 3 Rounds)\n\n" + "\n".join(lines)
-    else:
-        text = "Game over. No ranking implemented."
-    await event.respond(text)
+async def show_final_results_1v3(event, session):
+    max_rounds = session.get('max_rounds', 3)
+
+    async def get_player_name(uid):
+        return (await get_name(event, uid)) if 'get_name' in globals() else str(uid)
+
+    async def format_points_table():
+        lines = []
+        for uid in session['players']:
+            user = await event.client.get_entity(uid)
+            clickable_name = f"[{user.first_name}](tg://user?id={uid})"
+            round_points = session.get('round_points', {}).get(uid, [0] * max_rounds)
+            line = f"♦️ Player : {clickable_name}\n\n"
+            for r in range(max_rounds):
+                line += f"🔫 Round {r + 1} : {round_points[r] if r < len(round_points) else 0}\n\n"
+            line += f"🎋 Total : {sum(round_points)}\n"
+            line += "───────────────⊱\n"
+            lines.append(line)
+        return "".join(lines)
+
+
+    opponents = len(session['players']) - 1
+    points_table = await format_points_table()
+    text = f"──⊱ᴘᴏɪɴᴛꜱ ᴛᴀʙʟᴇ ( 1 ᴠs {opponents} )⊰──\n\n" + points_table
+
+    # Step 1: notify
+    await event.edit("📢 Now bot is sending the full pointstable!", parse_mode="html")
+    # Step 2: wait
+    await asyncio.sleep(4)
+    # Step 3: show actual table
+    await event.edit(text, parse_mode="html")
+    # wait 3 sec then send winner summary
+    await asyncio.sleep(3)
+    await show_final_solo_summary(event, session)
+
+
+
+
+
+async def show_final_solo_summary(event, session):
+    players = session['players']
+    all_names = [f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})" for uid in players]
+
+    # --- First Elimination (first death in entire game) ---
+    first_elim = []
+    if session.get("death_order"):
+        first_elim_user = await event.client.get_entity(session['death_order'][0])
+        first_elim = [f"[{first_elim_user.first_name}](tg://user?id={first_elim_user.id})"]
+
+    # Track stats
+    damage_taken = session.get("damage_taken", {uid: 0 for uid in players})
+    damage_dealt = session.get("damage_dealt", {uid: 0 for uid in players})
+    kills = session.get("kills", {uid: 0 for uid in players})
+    deaths = session.get("deaths", {uid: 0 for uid in players})
+    round_winners = session.get("round_winners", [])
+
+    # Most attacked
+    most_attacked = []
+    if damage_taken:
+        max_taken = max(damage_taken.values())
+        most_attacked = [f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})"
+                         for uid, v in damage_taken.items() if v == max_taken and v > 0]
+
+    # Most aggressive
+    most_attacker = []
+    if damage_dealt:
+        max_dealt = max(damage_dealt.values())
+        most_attacker = [f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})"
+                         for uid, v in damage_dealt.items() if v == max_dealt and v > 0]
+
+    # Most hated (players with 0 rounds won)
+    most_hated = [f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})"
+                  for uid, v in session['rounds_won'].items() if v == 0]
+
+    # Winner (highest points)
+    winner_uid = max(session['points'], key=lambda u: session['points'][u])
+    winner_entity = await event.client.get_entity(winner_uid)
+    winner_name = f"[{winner_entity.first_name}](tg://user?id={winner_uid})"
+
+    # Game duration
+    duration = datetime.datetime.now() - session.get("game_start_time", bot_start_time)
+    minutes, seconds = divmod(duration.seconds, 60)
+
+    # --- Build message ---
+    txt = f"""
+🎄 The Solo match has ended between {', '.join(all_names)}!
+
+───୨୧─────୨୧─────୨୧──
+
+🔪 First Elimination : {', '.join(first_elim) if first_elim else "None"}
+
+⚓ Most shooted player : {', '.join(most_attacked) if most_attacked else "None"}
+
+🎯 Most attacking player : {', '.join(most_attacker) if most_attacker else "None"}
+
+☠️ Most hated player : {', '.join(most_hated) if most_hated else "None"}
+
+───୨୧─────୨୧─────୨୧──
+
+🔰 𝗥𝗼𝘂𝗻𝗱 𝗪𝗶𝗻𝗻𝗲𝗿𝘀 :
+"""
+
+    for i, rw in enumerate(round_winners, 1):
+        rw_uid = rw.get("winner")
+        if not rw_uid: continue
+        rw_entity = await event.client.get_entity(rw_uid)
+        name = f"[{rw_entity.first_name}](tg://user?id={rw_uid})"
+        txt += (f"\n🔫 Round {i} : {name}\n"
+                f"🏴‍☠️ Kills : {kills.get(rw_uid,0)}\n"
+                f"☠️ Death : {deaths.get(rw_uid,0)}\n"
+                f"⚡ Hp reduced : {damage_dealt.get(rw_uid,0)}\n")
+
+    txt += f"""
+
+───୨୧─────୨୧─────୨୧──
+
+🏆 Winner : {winner_name}
+
+📯 Game duration : {minutes} min {seconds} sec
+"""
+
+    await event.respond(txt, parse_mode="markdown")
+
+
+
+
+async def show_final_results_2v2(event, session):
+    team1, team2 = session['teams']
+    team1_total = sum(session['points'][uid] for uid in team1)
+    team2_total = sum(session['points'][uid] for uid in team2)
+
+    winner_team = "Team A" if team1_total > team2_total else "Team B"
+
+    team1_share = team1_total // 2
+    team2_share = team2_total // 2
+
+    t1_names = " + ".join([await get_name(event, uid) for uid in team1])
+    t2_names = " + ".join([await get_name(event, uid) for uid in team2])
+
+    text = (
+        "🏆 Final Results (2v2 Best of 3)\n\n"
+        f"Team A - ({t1_names}) = {team1_total} pts\n"
+        f"Team B - ({t2_names}) = {team2_total} pts\n\n"
+        f"Winner Team: {winner_team}\n\n"
+        "Points distributed to each player:\n"
+        f"{await get_name(event, team1[0])}: {team1_share} pts\n"
+        f"{await get_name(event, team1[1])}: {team1_share} pts\n"
+        f"{await get_name(event, team2[0])}: {team2_share} pts\n"
+        f"{await get_name(event, team2[1])}: {team2_share} pts"
+    )
+    await event.edit(text, parse_mode="html")
+
+
 
 async def get_name(event, uid):
     user = await event.client.get_entity(uid)
@@ -484,7 +725,7 @@ async def handle_shot_other(event):
             item_str = ", ".join(items) if items else "No items"
             item_lines.append(f"🎒 [{u.first_name}](tg://user?id={uid}): {item_str}")
         await event.edit(
-            f"Alive bullets - {alive}\nBlank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>\n\n" + "\n".join(item_lines),
+            f"⚡ Live rounds - {alive}\n🎟️ Blank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>\n\n" + "\n".join(item_lines),
             parse_mode='html' # Explicitly setting parse_mode to html
         )
         await asyncio.sleep(10)
@@ -507,9 +748,33 @@ async def handle_shot_other(event):
         # Award points for successful hit
         await award_shoot_points(event, session, shooter_id, target_id, is_live, damage, used_hacksaw=(damage == 2), shot_type="normal shot")
 
-        text = f"💥 Boom! <a href='tg://user?id={shooter_id}'>{shooter.first_name}</a> shot <a href='tg://user?id={target_id}'>{target.first_name}</a> with a live bullet.\n\n[{damage} ⚡ reduced]"
+        if damage == 1:  # normal live bullet
+            target_link = f'<a href="tg://user?id={target.id}">{target.first_name}</a>'
+            shooter_link = f'<a href="tg://user?id={shooter.id}">{shooter.first_name}</a>'
+            live_messages = [
+                f"And that's the critical hit! Nice shot! Reducing 1 ⚡ of {target_link}!\n\n🎟️ Moving to next player",
+                f"Who cares? Hahaha ! I can still win {shooter_link} shooted a live round to {target_link}!\n\n🎟️ Moving to next player.."
+            ]
+            text = random.choice(live_messages)
+    
+        else:  # damage == 2 (Hacksaw active)
+            text = (
+                f"No matter how fast you are! You can't dodge a bullet! "
+                f"{shooter.first_name} shooted a combo bullet to {target.first_name}!\n"
+                f"Reducing ⚡2 of {target.first_name}.\n\n"
+                "🎟️ Moving to next player"
+            )
+
+
     else:
-        text = f"🔫 Click! <a href='tg://user?id={shooter_id}'>{shooter.first_name}</a> fired at <a href='tg://user?id={target_id}'>{target.first_name}</a> but it was a blank shell.\n\n[No ⚡ reduced]"
+        target_link = f'<a href="tg://user?id={target.id}">{target.first_name}</a>'
+        blank_messages = [
+            f"Oops! You shooted a blank shell.. {target_link} got no damage !\n\n🎟️ Moving to next player..",
+            f"Bad luck! That bullet was blank shell.. {target_link} is laughing and waiting for their turn..!\n\n🎟️ Moving to next player.."
+        ]
+        text = random.choice(blank_messages)
+
+
 
     await event.edit(text, parse_mode='html') # Explicitly setting parse_mode to html
     await asyncio.sleep(5)
@@ -558,7 +823,7 @@ async def handle_shot_self(event):
             item_str = ", ".join(items) if items else "No items"
             item_lines.append(f"🎒 <a href='tg://user?id={uid}'>{u.first_name}</a>: {item_str}")
         await event.edit(
-            f"Live bullets - {alive}\nBlank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>\n\n" + "\n".join(item_lines),
+            f"⚡ Live rounds - {alive}\n🎟️ Blank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>\n\n" + "\n".join(item_lines),
             parse_mode='html' # Explicitly setting parse_mode to html
         )
         await asyncio.sleep(10)
@@ -584,9 +849,30 @@ async def handle_shot_self(event):
             session.pop("hacksaw_user", None)
             session.pop("hacksaw_pending", None)
 
-        text = f"💥 Boom! <a href='tg://user?id={user_id}'>{user.first_name}</a> shot themselves with a live bullet.\n\n[{damage} ⚡ reduced]"
+        shooter_link = f"<a href='tg://user?id={user_id}'>{user.first_name}</a>"
+
+        if damage == 1:  # Normal live bullet
+            text = (
+                f"You made my work easy by shooting yourself! "
+                f"{shooter_link} shooted a live bullet to themselves! "
+                f"reducing ⚡ of {shooter_link}\n\n"
+                "🎟️ Moving to next player ..."
+            )
+        else:  # damage == 2 (Hacksaw active)
+            text = (
+                f"Patient is the key to success! Afraid to shoot others? "
+                f"{shooter_link} just shooted a combo bullet -2 ⚡ to themselves!\n\n"
+                "🎟️ Moving to next player.."
+            )
+
     else:
-        text = f"🔫 Click! <a href='tg://user?id={user_id}'>{user.first_name}</a> faced a blank shell 😂\n\n[No ⚡ reduced]\n\nYou get another chance to shoot!"
+        shooter_link = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+        text = (
+            f"Only Some people put their lives at risk! Got another chance... "
+            f"{shooter_link} shooted a blank shell to themselves!\n\n"
+            "🎟️ Waiting for their next move.."
+        )
+
 
     await event.edit(text, parse_mode='html') # Explicitly setting parse_mode to html
     await asyncio.sleep(5)
@@ -638,7 +924,7 @@ async def handle_dynamic_shot(event):
 
 
         await event.edit(
-            f"Live bullets - {alive}\nBlank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>",
+            f"⚡ Live rounds - {alive}\n🎟️ Blank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>",
             parse_mode='html' # Explicitly setting parse_mode to html
         )
         await asyncio.sleep(10)
@@ -660,9 +946,39 @@ async def handle_dynamic_shot(event):
         if session['hps'][target_id] <= 0 and target_id not in session['death_order']:
             session['death_order'].append(target_id)
 
-        text = f"💥 Boom! <a href='tg://user?id={target_id}'>{target.first_name}</a> got shot by a live bullet.\n\n[{damage} ⚡ reduced]"
+        
+        target_link = f'<a href="tg://user?id={target.id}">{target.first_name}</a>'
+        shooter_link = f'<a href="tg://user?id={shooter.id}">{shooter.first_name}</a>'
+
+        if damage == 1:  
+            target_link = f'<a href="tg://user?id={target.id}">{target.first_name}</a>'
+            shooter_link = f'<a href="tg://user?id={shooter.id}">{shooter.first_name}</a>'
+            live_messages = [
+                f"And that's the critical hit! Nice shot! Reducing 1 ⚡ of {target_link}!\n\n🎟️ Moving to next player",
+                f"Who cares? Hahaha ! I can still win {shooter_link} shooted a live round to {target_link}!\n\n🎟️ Moving to next player.."
+            ]
+            text = random.choice(live_messages)
+            
+            
+        else:  
+            text = (
+                f"No matter how fast you are! You can't dodge a bullet! "
+                f"{shooter_link} shooted a combo bullet to {target_link}!\n"
+                f"Reducing ⚡2 of {target_link}.\n\n"
+                "🎟️ Moving to next player"
+            )
+
+
     else:
-        text = f"🔫 Click! <a href='tg://user?id={target_id}'>{target.first_name}</a> faced a blank shell 😂\n\n[No ⚡ reduced]"
+        target_link = f'<a href="tg://user?id={target.id}">{target.first_name}</a>'
+        blank_messages = [
+            f"Oops! You shooted a blank shell.. {target_link} got no damage !\n\n🎟️ Moving to next player..",
+            f"Bad luck! That bullet was blank shell.. {target_link} is laughing and waiting for their turn..!\n\n🎟️ Moving to next player.."
+        ]
+        text = random.choice(blank_messages)
+
+
+
 
     if session.get("hacksaw_user") == shooter_id and session.get("hacksaw_pending"):
         session.pop("hacksaw_user", None)
@@ -724,60 +1040,192 @@ async def show_next_turn(event, session):
 
 
         await event.edit(
-            f"Live bullets - {alive}\nBlank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>",
+            f"⚡ Live rounds - {alive}\n🎟️ Blank bullets - {blank}\n\n<pre>Shotgun is getting loaded...</pre>",
             parse_mode='html' # Explicitly setting parse_mode to html
         )
         await asyncio.sleep(10)
         
 
-    active_blocks = []
-    eliminated_blocks = []
+    mode = session.get("mode")
+    current_turn_uid = session['players'][session['turn_index']]
 
-    for idx, uid in enumerate(session['players']):
+    # --- Prepare common buttons (Shoot, Items, End Game) ---
+    shooter_id = session['players'][session['turn_index']]
+    shoot_buttons = []
+    for uid in session['players']:
+        if uid != shooter_id and session['hps'].get(uid, 0) > 0:
+            target = await event.client.get_entity(uid)
+            shoot_buttons.append(Button.inline(f"Shoot ({target.first_name})", f"shoot_{uid}".encode()))
+    shoot_buttons.append(Button.inline("Shoot yourself", b"shot_self"))
+
+    # Arrange shoot buttons (2 per row)
+    button_rows = []
+    row = []
+    for btn in shoot_buttons:
+        row.append(btn)
+        if len(row) == 2:
+            button_rows.append(row)
+            row = []
+    if row:
+        button_rows.append(row)
+
+    # Add "view items" buttons (anyone can click)
+    item_view_buttons = []
+    for uid in session['players']:
         user = await event.client.get_entity(uid)
-        hp = session['hps'].get(uid, 0)
+        item_view_buttons.append(Button.inline(f"🎒 {user.first_name} Items", f"items_{uid}".encode()))
 
-        if hp > 0:
-            is_turn = idx == session['turn_index']
-            turn_label = " [Turn]" if is_turn else ""
-            hp_display = '⚡' * hp
-            items = session.get('items', {}).get(uid, [])
-            items_text = ", ".join(items) if items else "None"
+    row = []
+    for btn in item_view_buttons:
+        row.append(btn)
+        if len(row) == 2:
+            button_rows.append(row)
+            row = []
+    if row:
+        button_rows.append(row)
+
+    # End Game button
+    button_rows.append([Button.inline("❌ End Game", b"end_game")])
+
+    # ---- 1v1 UI ----
+    if mode == "normal" and session.get("player_count") == 2:
+        text  = "──⊱  ꜱᴏʟᴏ ᴍᴏᴅᴇ [ 1 vs 1 ] ⊰──\n\n"
+        text += f"              『 Ｒｏｕｎｄ {session.get('round', 1)} 』\n\n"
+        text += "༺═──────────────═༻\n\n"
+
+        for i, uid in enumerate(session['players']):
+            user = await event.client.get_entity(uid)
+            clickable_name = f"[{user.first_name}](tg://user?id={uid})"
+            turn_label = " [ current turn ]" if uid == current_turn_uid else ""
+            lives = "⚡️" * session['hps'].get(uid, 0)
+            items = ", ".join(session.get('items', {}).get(uid, [])) or "None"
+
+            text += f"♦️ Player : {clickable_name}{turn_label}\n"
+            text += f"✧ lives : {lives}\n"
+            text += f"✧ Items : {items}\n\n"
+
+            # Only add the thin separator between players
+            if i != len(session['players']) - 1:
+                text += "༺═──────────────═༻\n\n"
+
+        # Only one footer at the very bottom
+        text += "༺═────⊱◈◈◈⊰─────═༻\n"
+
+        await event.edit(text, buttons=button_rows, parse_mode="markdown", link_preview=False)
+        return
+
+
+    elif mode == "1v3":
+        text = "──⊱ ꜱᴏʟᴏ ᴍᴏᴅᴇ [ 1 vs 3 ] ⊰──\n\n"  # Gap after SOLO MODE
+        text += f"              『 Ｒｏｕｎｄ {session.get('round', 1)} 』\n\n"  # Gap after round
+        text += "༺═──────────────═༻\n\n"  # Separator before first player
+
+        active_players = []
+        eliminated_players = []
+
+        # First collect active and eliminated separately
+        for uid in session['players']:
+            user = await event.client.get_entity(uid)
+            clickable_name = f"[{user.first_name}](tg://user?id={uid})"
+            turn_label = " [ current turn ]" if uid == current_turn_uid else ""
+            lives = "⚡️" * session['hps'].get(uid, 0)
+            items = ", ".join(session.get('items', {}).get(uid, [])) or "None"
+
+            block = f"♦️ Player : {clickable_name}{turn_label}\n"
+            block += f"✧ lives : {lives}\n"
+            block += f"✧ Items : {items}\n\n"
+
+            if session['hps'].get(uid, 0) > 0:
+                active_players.append(block)
+            else:
+                eliminated_players.append(block)
+
+        # Add separator between active players, except after last
+        for i, block in enumerate(active_players):
+            text += block
+            if i != len(active_players) - 1:
+                text += "༺═──────────────═༻\n\n"
+
+        # Eliminated section (NO extra thin line at the bottom)
+        if eliminated_players:
+            text += "༺═────⊱◈◈◈⊰─────═༻\n"
+            text += "                [ELIMINATED]\n\n"
+            for i, block in enumerate(eliminated_players):
+                text += block
+                if i != len(eliminated_players) - 1:
+                    text += "༺═──────────────═༻\n\n"
+
+        # Footer
+        text += "༺═────⊱◈◈◈⊰─────═༻\n"
+
+        await event.edit(text, buttons=button_rows, parse_mode="markdown", link_preview=False)
+        return
+
+    elif mode == "2v2" and session.get("player_count") == 4 and 'teams' in session:
+        text  = "──⊱ ᴅᴜᴀʟ  ᴍᴏᴅᴇ ( 2 ᴠs 2 )⊰──\n\n"
+        text += f"              『 Ｒｏᴜɴᴅ {session.get('round', 1)} 』\n\n"
+        text += "༺═──────────────═༻\n\n"
+
+        team1, team2 = session['teams']
+        current_turn_uid = session['players'][session['turn_index']]
+
+        active_players = []
+        eliminated_players = []
+
+        for uid in session['players']:
+            user = await event.client.get_entity(uid)
+            symbol = "♦️" if uid in team1 else "🔷"
+            turn_label = " [ current turn ]" if uid == current_turn_uid else ""
+            lives = "⚡️" * session['hps'].get(uid, 0)
+            items = ", ".join(session.get('items', {}).get(uid, [])) or ""
 
             block = (
-                f"<blockquote><b>👤 <a href='tg://user?id={uid}'>{user.first_name}</a>{turn_label}</blockquote>\n"
-                f"<blockquote>├ ID: {uid}\n"
-                f"├ HP: {hp_display}\n"
-                f"├ Items: {items_text}</b></blockquote>\n"
+                f"{symbol} Player : [{user.first_name}](tg://user?id={uid}){turn_label}\n"
+                f"✧ lives : {lives}\n"
+                f"✧ Items : {items}\n\n"
             )
 
+            if session['hps'].get(uid, 0) > 0:
+                active_players.append(block)
+            else:
+                eliminated_players.append(block)
 
-            active_blocks.append(block)
-        else:
-            items = session.get('items', {}).get(uid, [])
-            items_text = ", ".join(items) if items else "None"
+        # Active players with separator except after last
+        for i, block in enumerate(active_players):
+            text += block
+            if i != len(active_players) - 1:
+                text += "༺═──────────────═༻\n\n"
 
-            block = (
-                f"<blockquote><b>👤 <a href='tg://user?id={uid}'>{user.first_name}</a> [Eliminated]</blockquote>\n"
-                f"<blockquote>├ ID: {uid}\n"
-                f"├ HP: ☠️ Eliminated\n"
-                f"├ Items: {items_text}</b></blockquote>\n"
-            )
+        # Eliminated section
+        if eliminated_players:
+            text += "༺═────⊱◈◈◈⊰─────═༻\n\n"
+            text += "             [ELIMINATED]\n\n"
+            for i, block in enumerate(eliminated_players):
+                text += block
+                if i != len(eliminated_players) - 1:
+                    text += "༺═──────────────═༻\n\n"
 
-            eliminated_blocks.append(block)
+        # Footer
+        text += "༺═────⊱◈◈◈⊰─────═༻\n\n"
 
-    game_board = (
-        "<b>╔══BUCKSHOT ROULETTE══╗</b>\n\n"
-        f"                  <b>『Round {session['round']}』</b>\n\n" +
-       "\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n".join(active_blocks) +
-        "\n<b>╚═══════════════╝</b>"
-    )
+        # Team mates listing
+        team1_names = [f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})" for uid in team1]
+        team2_names = [f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})" for uid in team2]
 
-    eliminated_board = (
-        "\n\n<b>✘===Eliminated Players===✘</b>\n\n" +
-        "\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔".join(eliminated_blocks) +
-        "\n<b>✘====================✘</b>"
-    ) if eliminated_blocks else ""
+        text += "🧩 Tᴇᴀᴍ ᴍᴀᴛᴇs :\n"
+        text += f"╰─🔷 : {' & '.join(team2_names)}\n"
+        text += f"╰─♦️: {' & '.join(team1_names)}\n"
+
+        await event.edit(text, buttons=button_rows, parse_mode="markdown", link_preview=False)
+        return
+        
+
+
+    
+
+# ---- Default UI (unchanged) ----
+# paste your old active_blocks/eliminated_blocks logic here
+
 
     shooter_id = session['players'][session['turn_index']]
     shoot_buttons = []
@@ -1006,7 +1454,8 @@ async def use_cigarette_handler(event):
     session['hps'][uid] += 1
     # Deduct penalty points for healing item use
     apply_healing_penalty(session, uid)
-    await log_points(event, uid, "used Cigarette, lost 15 pts")
+    await log_points(event, uid, f"used Cigarette, lost {HEALING_PENALTY} pts")
+
 
 
     await event.edit(
@@ -1226,9 +1675,10 @@ async def back_to_steal_player(event):
 
     buttons = []
     for pid in session['players']:
-        if pid != uid and session['hps'].get(pid, 0) > 0:
+        if pid != uid:  # don't show yourself
             user = await event.client.get_entity(pid)
             buttons.append([Button.inline(user.first_name, f"steal_from_{pid}".encode())])
+
 
     await event.edit("🧪 Choose a player to steal from:", buttons=buttons)
 
@@ -1364,7 +1814,8 @@ async def finalize_steal(event):
             msg = f"🧪 {thief.first_name} stole 💊 Expired Medicine and it took -1 ⚡ Hp!"
         # Deduct penalty points for using Expired Medicine
         apply_healing_penalty(session, uid)
-        await log_points(event, uid, "used expired medicine, lost 15 pts")
+        await log_points(event, uid, f"used Expired Medicine, lost {HEALING_PENALTY} pts")
+
 
 
 
@@ -1488,7 +1939,7 @@ async def use_burner_handler(event):
     index = random.randint(1, total - 1)  # skip index 0 (next shot)
     bullet_type = remaining[index]  # Get real bullet type (immune to Inverter)
 
-    bullet_str = "<b>Live shell.</b>" if bullet_type == "live" else "<b>Blank shell.</b>"
+    bullet_str = "Live shell." if bullet_type == "live" else "Blank shell."
     msg = f"📱 Calling...\n\nCartridge {index + 1} ... {bullet_str}"
 
     await event.answer(msg, alert=True)
@@ -1544,7 +1995,12 @@ async def use_expired_medicine_handler(event):
             session['hps'][uid] = 0
         msg = f"💊 <a href='tg://user?id={uid}'>{event.sender.first_name}</a> used Expired Medicine and lost 1 ⚡ HP... 😵"
 
-    await event.edit(msg, parse_mode='html') # Explicitly setting parse_mode to html
+    # ✅ Deduct healing penalty points here
+    apply_healing_penalty(session, uid)
+    await log_points(event, uid, f"used Expired Medicine, lost {HEALING_PENALTY} pts")
+
+    await event.edit(msg, parse_mode='html')  # Explicitly setting parse_mode to html
+
     await asyncio.sleep(6)
 
     # 🔁 Check if medicine caused a death
@@ -1763,94 +2219,117 @@ async def check_end_of_round(event, session):
         team1_alive = [uid for uid in team1 if session['hps'].get(uid, 0) > 0]
         team2_alive = [uid for uid in team2 if session['hps'].get(uid, 0) > 0]
 
-        if not team1_alive or not team2_alive:
-            winning_team = team1 if team1_alive else team2
-            team_key = "team1" if winning_team == team1 else "team2"
+        # ✅ Round ends ONLY when one full team is eliminated
+        if len(team1_alive) == 0 or len(team2_alive) == 0:
+            # Determine which team is still alive
+            winning_team = team1 if len(team1_alive) > 0 else team2
+            # CREATE elimination_order from death_order + last survivor
+            winner_uid = winning_team[0] if winning_team else None
+            if winner_uid:
+                elimination_order = session['death_order'] + [winner_uid]
+            else:
+                elimination_order = session['death_order']
 
-            winners_text = "\n".join([
-                f"<a href='tg://user?id={uid}'>{(await event.client.get_entity(uid)).first_name}</a>"
+            await award_2v2_points(event, session, elimination_order)
+
+            # Increase rounds played
+            session['round'] = session.get('round', 1) + 1
+
+            # --- Custom 2v2 round winner message ---
+            winner_clickables = [
+                f"[{(await event.client.get_entity(uid)).first_name}](tg://user?id={uid})"
                 for uid in winning_team
-            ])
+            ]
+            await event.edit(
+                f"♦️ Round {session['round'] - 1} ended...!!\n"
+                f"💥 {' and '.join(winner_clickables)} won this Round. "
+                f"Congratulations to the winning team ... Moving to next round!\n"
+                f"🔷 Starting Round no.{session['round']} hold a second..",
+                parse_mode="markdown"
+            )
+            await asyncio.sleep(5)
 
-            last_winner = session.get("last_team_win")
-            if last_winner == team_key:
-                await event.edit(
-                    f"🏆 Consecutive Victory!\n\n🎉 {winners_text} have won the 2v2 match by winning 2 rounds back-to-back!",
-                    parse_mode='html'
-                )
+            # If match finished, show final scores
+            if session['round'] > session.get('max_rounds', 3):
+                await show_final_results_2v2(event, session)
                 for uid in session['players']:
                     locked_players.discard(uid)
                 sessions.pop(event.chat_id, None)
                 return True
-            else:
-                session["last_team_win"] = team_key
-                await event.edit(
-                    f"✅ Round won by:\n{winners_text}\n\n⚔️ Prepare for the next round!",
-                    parse_mode='html'
-                )
-                await asyncio.sleep(7)
-                await event.edit("🏁 New round is starting...\nReshuffling health, items and bullets!")
-                await asyncio.sleep(5)
 
-                shared_hp = random.randint(1, 2)
-                session['hps'] = {uid: shared_hp for uid in session['players']}
-                session['max_hps'] = {uid: shared_hp for uid in session['players']}
-                session['death_order'] = []
+            # Reset for new round
+            shared_hp = random.randint(1, 2)
+            session['hps'] = {uid: shared_hp for uid in session['players']}
+            session['max_hps'] = {uid: shared_hp for uid in session['players']}
+            session['death_order'] = []
+            reset_items_new_round(session)
 
-                reset_items_new_round(session)
+            # 🔄 Keep alternating team order each round
+            team1, team2 = session['teams']
+            new_order = []
+            for i in range(len(team1)):
+                new_order.append(team1[i])
+                new_order.append(team2[i])
+            session['players'] = new_order
 
-                total_bullets = random.randint(3, 8)
-                blank = random.randint(1, total_bullets - 1)
-                alive = total_bullets - blank
-                bullets = ['live'] * alive + ['blank'] * blank
-                random.shuffle(bullets)
-                session['bullet_queue'] = bullets
+            # Reload bullets
+            total_bullets = random.randint(3, 8)
+            blank = random.randint(1, total_bullets - 1)
+            alive = total_bullets - blank
+            bullets = ['live'] * alive + ['blank'] * blank
+            random.shuffle(bullets)
+            session['bullet_queue'] = bullets
+            session['turn_index'] = 0
 
-                session['turn_index'] = 0
-                session['eliminated'] = []
-                return await show_next_turn(event, session)
+            await show_reload_message(event, session)
+            await show_next_turn(event, session)
+            return True
 
+
+
+
+    # ---- 1v3 mode ----
     # ---- 1v3 mode ----
     if session['mode'] == "1v3" and len(alive_list) == 1:
         winner_uid = alive_list[0]
-        session['round'] += 1
-        session['eliminated'] = [uid for uid in session['players'] if uid != winner_uid]
-
-        # Award 1v3 points
+    
+    # Make sure session['death_order'] is fully populated:
+        for uid in session['players']:
+            if uid not in session['death_order'] and uid != winner_uid and session['hps'].get(uid, 0) <= 0:
+                session['death_order'].append(uid)
+    # Now create elimination_order:
         elimination_order = session['death_order'] + [winner_uid]
-
+    
         await award_1v3_points(event, session, elimination_order)
-
-
-        if session['round'] > 3:
-            await show_final_results(event, session)
+    
+        if session['round'] >= 3:    # or session['round'] > 3 depending on your logic
+            await show_final_results_1v3(event, session)
             for uid in session['players']:
                 locked_players.discard(uid)
             sessions.pop(event.chat_id, None)
             return True
-
+        session['round'] += 1
         await asyncio.sleep(7)
         await event.edit(f" Round {session['round']} is starting...\nReshuffling health, items and bullets!")
-        await asyncio.sleep(5)
         shared_hp = random.randint(1, 2)
         session['hps'] = {uid: shared_hp for uid in session['players']}
         session['max_hps'] = {uid: shared_hp for uid in session['players']}
         session['death_order'] = []
-
         reset_items_new_round(session)
-
         total_bullets = random.randint(3, 8)
         blank = random.randint(1, total_bullets - 1)
         alive = total_bullets - blank
         bullets = ['live'] * alive + ['blank'] * blank
         random.shuffle(bullets)
         session['bullet_queue'] = bullets
-
         session['turn_index'] = 0
         session['eliminated'] = []
+        await show_reload_message(event, session)
         await show_next_turn(event, session)
-        return True
+        return True        
 
+ 
+ 
     # ---- 1v1 mode ----
     if session['player_count'] == 2 and len(alive_list) == 1:
         alive = alive_list[0]
@@ -1890,7 +2369,8 @@ async def check_end_of_round(event, session):
             session['turn_index'] = session['players'].index(alive)
         else:
             session['turn_index'] = 0
-
+            
+        await show_reload_message(event, session)
         await show_next_turn(event, session)
         return True
 
@@ -2082,15 +2562,34 @@ async def send_message_handler(event):
 
     # Fallback
     await event.reply("Usage:\n- In group (reply): .send <message>\n- In PM:\n  • .send <chat_id> <message>\n  • reply to media/text with .send <chat_id>")
+
+app = FastAPI()
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok"}
+
+def run_bot():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot.run_until_disconnected())
+
+def run_webserver():
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    # Start bot in a separate thread
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    
+    # Start web server in the main thread
+    run_webserver()
+
    
     
     
 # Run bot
 bot.run_until_disconnected()
-
-
-# Start the keep-alive web server
-keep_alive()
 
 # Start the bot
 client.start(bot_token=BOT_TOKEN)
