@@ -1,13 +1,13 @@
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
-import asyncio
 import datetime
 import random
 import os
-from fastapi import FastAPI
-import uvicorn
 import threading
 import asyncio
+import asyncio
+import uvicorn
+from fastapi import FastAPI
 
 
 
@@ -16,11 +16,22 @@ API_HASH = '21e8ed894fc3eb3e40ca1d277609e114'
 BOT_TOKEN = '8074351087:AAE656jg51zZ9tA4pwREjb0Gd9qG6Jyw7oI'
 MOD_IDS = {7556899383, 7038303029, 1716686899, 7663874497, 7735193452}  # Replace with actual mod Telegram user IDs
 
-bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = TelegramClient("bot", API_ID, API_HASH)
+
 
 sessions = {}
 locked_players = set()
 bot_start_time = datetime.datetime.now()
+
+
+
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/")
+async def home():
+    return {"status": "ok"}
+
 
 async def show_reload_message(event, session):
     # Decide how many bullets in this reload
@@ -2564,25 +2575,24 @@ async def send_message_handler(event):
     await event.reply("Usage:\n- In group (reply): .send <message>\n- In PM:\n  • .send <chat_id> <message>\n  • reply to media/text with .send <chat_id>")
 
 
-app = FastAPI()
+async def start_telethon_bot():
+    await bot.start(bot_token=BOT_TOKEN)
+    print("🤖 Bot started")
+    await bot.run_until_disconnected()
 
-@app.get("/")
-async def health_check():
-    return {"status": "ok"}
-
-async def main():
-    # Run the bot and the webserver concurrently using async tasks
-    bot_task = asyncio.create_task(bot.run_until_disconnected())
-    web_task = asyncio.create_task(uvicorn_serve())
-    await asyncio.gather(bot_task, web_task)
-
-async def uvicorn_serve():
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+async def start_server():
+    config = uvicorn.Config(app, host="0.0.0.0", port=10000, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
+async def main():
+    # run both bot and server together
+    await asyncio.gather(start_telethon_bot(), start_server())
+
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
    
@@ -2594,4 +2604,3 @@ bot.run_until_disconnected()
 # Start the bot
 client.start(bot_token=BOT_TOKEN)
 client.run_until_disconnected()
-
